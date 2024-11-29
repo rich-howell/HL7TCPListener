@@ -14,7 +14,7 @@ public static class AppBuilderExtensions
         }
         builder.WebHost.ConfigureKestrel(kestrelServerOptions =>
         {
-            kestrelServerOptions.ListenAnyIP(4040, listenOptions =>
+            kestrelServerOptions.ListenAnyIP(port, listenOptions =>
             {
                 if (enableTls)
                 {
