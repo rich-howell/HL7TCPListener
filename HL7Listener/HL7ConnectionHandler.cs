@@ -1,4 +1,5 @@
 ﻿using Microsoft.AspNetCore.Connections;
+using Microsoft.Extensions.Logging;
 using NHapi.Base.Parser;
 using NHapiTools.Base;
 using NHapiTools.Base.Util;
@@ -42,91 +43,135 @@ public class HL7ConnectionHandler : ConnectionHandler
 
     public async Task HandleConnection(ConnectionContext connectionContext)
     {
+        var remote = connectionContext.RemoteEndPoint?.ToString() ?? "Unknown";
+
         Directory.CreateDirectory(DumpFolder);
 
-        _logger.LogInformation("Connected to {remotenode}", connectionContext.RemoteEndPoint);
-        while (true)
+        _logger.LogInformation("New connection established from {Remote}", remote);
+
+        var startTime = DateTime.UtcNow;
+
+        try
         {
-            // Read the next frame
-            var result = await connectionContext.Transport.Input.ReadAsync();
-            ReadOnlySequence<byte> buffer = result.Buffer;
-
-            while (TryReadMllpFrame(ref buffer, out ReadOnlySequence<byte> frame))
+            while (true)
             {
-                // Process the MLLP frame
-                await ProcessHl7Message(frame,connectionContext.Transport);
-            }
+                var result = await connectionContext.Transport.Input.ReadAsync();
+                ReadOnlySequence<byte> buffer = result.Buffer;
 
-            // Tell the PipeReader how much of the buffer has been consumed.
-            connectionContext.Transport.Input.AdvanceTo(buffer.Start, buffer.End);
+                if (buffer.Length > 0)
+                {
+                    _logger.LogDebug("Received {Bytes} bytes from {Remote}", buffer.Length, remote);
+                }
 
-            // Stop reading   
-            //if there's no more data coming.
-            if (result.IsCompleted)
-            {
-                break;
+                while (TryReadMllpFrame(ref buffer, out ReadOnlySequence<byte> frame))
+                {
+                    _logger.LogDebug("Processing MLLP frame ({Length} bytes) from {Remote}", frame.Length, remote);                    
+                    await ProcessHl7Message(frame, connectionContext.Transport);
+                }
+
+                connectionContext.Transport.Input.AdvanceTo(buffer.Start, buffer.End);
+
+                if (result.IsCompleted)
+                {
+                    _logger.LogInformation("Connection from {Remote} closed by client", remote);
+                    break;
+                }
             }
         }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error during connection with {Remote}", remote);
+        }
+        finally
+        {
+            var elapsed = DateTime.UtcNow - startTime;
+            _logger.LogInformation("Disconnected from {Remote} (session length {Seconds}s)", remote, elapsed.TotalSeconds);
+            await connectionContext.Transport.Input.CompleteAsync();
+        }
 
-        await connectionContext.Transport.Input.CompleteAsync();
-        _logger.LogInformation("Disconneded from  {remotenode}", connectionContext.RemoteEndPoint);
+    }
+
+    private static string ConsoleSafe(string hl7)
+    {
+        return hl7
+            .Replace(((char)0x0B).ToString(), "")          // strip VT
+            .Replace(((char)0x1C).ToString(), "")          // strip FS
+            .Replace("\r", Environment.NewLine)            // make segments visible
+            .TrimEnd();                                     // (optionally .TrimEnd() to remove trailing extra newline)
     }
 
     private bool TryReadMllpFrame(ref ReadOnlySequence<byte> buffer, out ReadOnlySequence<byte> frame)
     {
-        var start = buffer.PositionOf((byte)0x0B);
-        var end = buffer.PositionOf((byte)0x1C);
+        var start = buffer.PositionOf((byte)0x0B); // VT
+        var end = buffer.PositionOf((byte)0x1C);   // FS
+
         if (start != null && end != null)
         {
-            frame = buffer.Slice(start.Value , buffer.GetPosition(1, end.Value));
+            // slice cleanly between start and end
+            frame = buffer.Slice(start.Value, buffer.GetPosition(1, end.Value));
+
+            // advance to the byte after the FS (not two steps!)
             buffer = buffer.Slice(buffer.GetPosition(1, end.Value));
+
             return true;
         }
+
         frame = default;
         return false;
     }
 
     private async Task ProcessHl7Message(ReadOnlySequence<byte> message,System.IO.Pipelines.IDuplexPipe transport)
     {
+        // Flatten the sequence into one contiguous byte array
+        var data = message.ToArray();
+
+        int start = Array.IndexOf(data, (byte)0x0B); //(VT = 0x0B
+        int end = Array.IndexOf(data, (byte)0x1C); //FS = 0x1C
+
+        byte[] payload = data;
+        if(start >= 0 && end > start)
+        {
+            payload = data.Skip(start + 1).Take(end - start - 1).ToArray();
+        }
+
+        var strMessage = Encoding.UTF8.GetString(payload);
+
+        _logger.LogInformation("Received raw HL7 message:\n{Message}", ConsoleSafe(strMessage));
+
         try
         {
-            var mllpFrame = message.Slice(1, message.Length - 2);
-            var strMessage = Encoding.UTF8.GetString(mllpFrame);
-
-            _logger.LogInformation("Received HL7 Message {msg}", strMessage);
-
-            var parsedMessage = pipeParser.Parse(strMessage.TrimEnd('\n'));
+            var parsedMessage = pipeParser.Parse(strMessage);
             var terser = new NHapi.Base.Util.Terser(parsedMessage);
 
-            var controlId = terser.Get("/MSH-10") ?? Guid.NewGuid().ToString();
-
-            string filename = $"{DateTime.Now:yyyyMMdd_HHmmss}_{controlId}.hl7";
-            string filePath = Path.Combine(DumpFolder, filename);
-            await File.WriteAllTextAsync(filePath, strMessage);
-            _logger.LogInformation("Message written to {path}", filePath);
-
+            var controlId = terser.Get("/MSH-10") ?? "Unknown";
+            var msgCode = terser.Get("/MSH-9-1") ?? "Unknown";
+            var trigger = terser.Get("/MSH-9-2") ?? "Unknown";
+            var msgType = $"{msgCode}^{trigger}";
             var sendingApp = terser.Get("/MSH-3") ?? "UnknownApp";
-            var sendingFacility = terser.Get("MSH-4") ?? "UnknownFacility";
+            var sendingFacility = terser.Get("/MSH-4") ?? "UnknownFacility";
+
+            _logger.LogInformation("Parsed HL7 message {ControlId}: {MsgType} from {App}/{Facility}",controlId, msgType, sendingApp, sendingFacility);
+
+            var filename = $"{DateTime.Now:yyyyMMdd_HHmmss}_{controlId}.hl7";
+            var filePath = Path.Combine(DumpFolder, filename);
+
+            await File.WriteAllTextAsync(filePath, strMessage);
+            _logger.LogInformation("Message persisted to {Path}", filePath);
 
             var ackMsg = parsedMessage.GenerateAck(AckTypes.AA, sendingApp, sendingFacility);
             var ackString = pipeParser.Encode(ackMsg);
-
             string framedAck = $"{(char)0x0B}{ackString}{(char)0x1C}{(char)0x0D}";
             var ackBytes = Encoding.UTF8.GetBytes(framedAck);
-
-            var parts = strMessage.Split('\r');
-            var hl7Msg = string.Join("\r\n", strMessage.Split('\r'));
 
             await transport.Output.WriteAsync(ackBytes);
             await transport.Output.FlushAsync();
 
-            _logger.LogInformation("ACK sent for control ID {id}", controlId);
-
+            _logger.LogInformation("ACK sent for {ControlId} (type {MsgType})", controlId, msgType);
             store.AddMessage(strMessage);
         } 
         catch (Exception ex) 
         {
-            _logger.LogError(ex, "HL7 message processing failed");
+            _logger.LogError(ex, "HL7 message processing failed. Payload:\n{Message}", strMessage);
         }        
     }
 }
