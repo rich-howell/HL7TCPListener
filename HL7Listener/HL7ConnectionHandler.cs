@@ -16,18 +16,22 @@ public class HL7ConnectionHandler : ConnectionHandler
     private readonly ILoggerFactory loggerFactory;
     private readonly MessageStore store;
     private readonly string DumpFolder;
+    private readonly SseHub hub;
 
     public HL7ConnectionHandler(
         PipeParser pipeParser,
         ILoggerFactory loggerFactory,
         IConfiguration config,
-        MessageStore store)
+        MessageStore store,
+        SseHub hub
+        )
     {
         _logger = loggerFactory.CreateLogger<HL7ConnectionHandler>();
         this.pipeParser = pipeParser;
         this.loggerFactory = loggerFactory;
         this.config = config;
         this.store = store;
+        this.hub = hub;
 
         DumpFolder = config["HL7Settings:DumpFolder"]
             ?? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "ReceivedHL7");
@@ -165,6 +169,8 @@ public class HL7ConnectionHandler : ConnectionHandler
 
             await transport.Output.WriteAsync(ackBytes);
             await transport.Output.FlushAsync();
+
+            await hub.BroadcastAsync($"New message received at {DateTime.Now:HH:mm:ss}");
 
             _logger.LogInformation("ACK sent for {ControlId} (type {MsgType})", controlId, msgType);
             store.AddMessage(strMessage);
