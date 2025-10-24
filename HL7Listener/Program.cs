@@ -26,6 +26,7 @@ Log.Information("Starting HL7 listener bootstrap...");
 
 builder.Services.AddSingleton<PipeParser>();
 builder.Services.AddSingleton<MessageStore>();
+builder.Services.AddSingleton<SseHub>();
 
 bool enableTls = false;
 string certificateInPfx = "certificate.pfx";
@@ -105,11 +106,38 @@ app.MapGet("/dashboard", () =>
                 }}
             }}
 
-            refresh();
-            setInterval(refresh, 3000); // every 3 seconds
+            const evt = new EventSource('/events');
+            evt.onmessage = (e) => {{
+                console.log('SSE:', e.data);
+                refresh();
+            }};
+            evt.onerror = (e) => console.error('SSE error', e);
+
+            window.addEventListener('beforeunload', () => evt.close());
+            refresh(); // initial load
         </script>
     </body>
     </html>", "text/html");
+});
+
+app.MapGet("/events", async (HttpContext context, SseHub hub) =>
+{
+    context.Response.Headers.Add("Content-Type", "text/event-stream");
+    context.Response.Headers.Add("Cache-Control", "no-cache");
+    context.Response.Headers.Add("Connection", "keep-alive");
+    context.Response.Headers.Add("X-Accel-Buffering", "no"); // prevent proxy buffering
+
+    var id = Guid.NewGuid();
+    var writer = new StreamWriter(context.Response.Body);
+    hub.Register(id, writer);
+
+    var completion = new TaskCompletionSource();
+    context.RequestAborted.Register(() => {
+        hub.Unregister(id);
+        completion.TrySetResult();
+    });
+
+    await completion.Task; // <--- keeps connection alive
 });
 
 // ---------------------------------------------------
