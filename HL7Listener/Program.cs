@@ -1,7 +1,28 @@
 using HL7Listener;
 using NHapi.Base.Parser;
+using Serilog;
+using Serilog.Events;
 
 var builder = WebApplication.CreateBuilder(args);
+var config = builder.Configuration;
+
+// Configure Serilog logging
+
+Log.Logger = new LoggerConfiguration()
+    .Enrich.FromLogContext()
+    .WriteTo.Console()
+    .WriteTo.File(
+        path: Path.Combine(AppContext.BaseDirectory, "Logs", "hl7listener-.log"),
+        rollingInterval: RollingInterval.Day,
+        retainedFileCountLimit: 7,
+        shared: true)
+    .CreateLogger();
+
+builder.Host.UseSerilog(); // replace built-in logging
+
+Log.Information("Starting HL7 listener bootstrap...");
+
+// Configure services and settings
 
 builder.Services.AddSingleton<PipeParser>();
 builder.Services.AddSingleton<MessageStore>();
@@ -9,11 +30,18 @@ builder.Services.AddSingleton<MessageStore>();
 bool enableTls = false;
 string certificateInPfx = "certificate.pfx";
 string certificatePw = "PaSswoRd~@34";
-var config = builder.Configuration;
 
+string dumpFolder = config.GetValue<string>("HL7Settings:DumpFolder") ?? Path.Combine(AppContext.BaseDirectory, "ReceivedHL7");
 
 int hl7Port = config.GetValue<int>("HL7Settings:HL7Port", 4040);
 int webPort = config.GetValue<int>("HL7Settings:WebPort", 5000);
+
+Log.Information("HL7Port: {HL7Port}, WebPort: {WebPort}, DumpFolder: {DumpFolder}",
+    hl7Port, webPort, dumpFolder);
+
+
+// Configure HL7 TCP listener + Web Dashboard
+
 
 builder.AddHL7Support(hl7Port, enableTls, certificateInPfx, certificatePw);
 
@@ -22,7 +50,10 @@ builder.WebHost.ConfigureKestrel(options =>
     options.ListenAnyIP(webPort);
 });
 
-//Build & Run
+//
+// Build & Run
+//
+
 var app = builder.Build();
 
 // API endpoint
@@ -81,4 +112,12 @@ app.MapGet("/dashboard", () =>
     </html>", "text/html");
 });
 
+// ---------------------------------------------------
+// Run and log startup info
+// ---------------------------------------------------
+Log.Information("Starting web dashboard on port {WebPort}", webPort);
+Log.Information("Starting HL7 TCP listener on port {HL7Port}", hl7Port);
+
 app.Run();
+
+Log.CloseAndFlush();
